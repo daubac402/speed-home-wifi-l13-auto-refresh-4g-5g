@@ -1,3 +1,10 @@
+# Speed Wi-Fi HOME 5G L13 - auto refresh / 4G-5G switch
+# Reset the router's mobile connection by toggling the Preferred Network Type,
+# or switch directly with --mode 4g / --mode 5g. See README.md for full usage:
+#   python reset_network_type.py [--mode {4g,5g}] [--status] [--dry-run]
+#
+# The real .env (which holds ROUTER_PASSWORD) must never be committed.
+
 # Sensitive values
 .env
 
@@ -5,3 +12,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Local logs / editor files
+*.log
+.vscode/
+.idea/

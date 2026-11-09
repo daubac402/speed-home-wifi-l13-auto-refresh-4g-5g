@@ -26,8 +26,11 @@ Protocol details (reverse-engineered from the router's own js/service.js):
     (the SA/NSA radio is forced off when 4G Only is selected, like the UI does)
 
 Usage:
-    python3 reset_network_type.py            # do the toggle
-    python3 reset_network_type.py --dry-run  # login + show plan, change nothing
+    python3 reset_network_type.py                # reset: toggle 5G <-> 4G <-> 5G
+    python3 reset_network_type.py --mode 5g      # switch straight to 5G Preferred
+    python3 reset_network_type.py --mode 4g      # switch straight to 4G Only
+    python3 reset_network_type.py --status       # login + show current status only
+    python3 reset_network_type.py --dry-run      # login + show plan, change nothing
 
 Password is read from the ROUTER_PASSWORD key in .env (see .env.example).
 No third-party packages required.
@@ -62,6 +65,9 @@ MODE_LABELS = {
     MODE_4G: "4G Only",
     "Only_5G": "5G SA",
 }
+
+# Values accepted by the --mode command-line option
+CLI_MODES = {"4g": MODE_4G, "5g": MODE_5G}
 
 # 5G Standalone setting sent together with the network type
 SA_MODE_DISABLED = "disable_mode_sa"   # 5G standalone: disabled (forced on 4G)
@@ -220,6 +226,16 @@ def read_current_state() -> dict:
     return state
 
 
+def describe_state(state: dict) -> str:
+    """Human-readable one-line summary of the current network state."""
+    mode = state.get("net_select")
+    sa_mode = state.get("sa_nsa_mode_disable_setting")
+    return (
+        f"Preferred Network Type: {MODE_LABELS.get(mode, mode)} ({mode}), "
+        f"5G standalone: {SA_MODE_LABELS.get(sa_mode, sa_mode)}"
+    )
+
+
 def apply_network_mode(mode: str, sa_mode: str) -> None:
     """Equivalent of choosing a Preferred Network Type and pressing Apply."""
     log(f"Sending SET_BEARER_PREFERENCE: BearerPreference={mode}, "
@@ -306,7 +322,18 @@ def get_password() -> str:
 # --------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Reset the mobile connection by toggling Preferred Network Type."
+        description="Reset or switch the mobile connection technology (4G/5G) "
+        "of a Speed Wi-Fi HOME 5G L13 router."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=sorted(CLI_MODES),
+        help="switch directly to this network type instead of toggling",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="show the current Preferred Network Type and exit (no changes)",
     )
     parser.add_argument(
         "--dry-run",
@@ -315,18 +342,28 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.status and args.mode:
+        parser.error("--status and --mode cannot be used together")
+    if args.status and args.dry_run:
+        parser.error("--status and --dry-run cannot be used together")
+
     password = get_password()
     log(f"Router: {BASE_URL} (UI page: {LOGIN_PAGE_URL})")
     log(f"Password loaded from .env: {len(password)} characters")
     log("=== Step A: login ===")
     login(password)
     try:
-        log("=== Step B: read current Preferred Network Type ===")
+        log("=== Step B: read current status ===")
         state = read_current_state()
         current = state["net_select"]
         sa_mode = state["sa_nsa_mode_disable_setting"]
         log(f"Read: net_select={current!r}, "
             f"sa_nsa_mode_disable_setting={sa_mode!r}")
+        log(f"Status: {describe_state(state)}")
+
+        if args.status:
+            log("Status only - nothing changed.")
+            return 0
 
         if current not in (MODE_5G, MODE_4G):
             raise RouterError(
@@ -334,10 +371,41 @@ def main() -> int:
                 f"(expected {MODE_5G!r} or {MODE_4G!r}) - aborting."
             )
 
-        # The other mode is the temporary one we toggle through.
+        # --- Explicit switch: go straight to the requested technology --------
+        if args.mode:
+            target = CLI_MODES[args.mode]
+            if current == target:
+                log(f"Already using {MODE_LABELS[target]} ({target}) - nothing to do.")
+                return 0
+            # Like the UI, 4G Only forces 5G standalone off; selecting 5G
+            # Preferred turns it back on.
+            target_sa = SA_MODE_DISABLED if target == MODE_4G else SA_MODE_ENABLED
+            log(f"Plan: {MODE_LABELS[current]} -> {MODE_LABELS[target]} (Apply), "
+                f"5G standalone {SA_MODE_LABELS[target_sa]}")
+
+            if args.dry_run:
+                log("Dry run - nothing changed.")
+                return 0
+
+            log(f"=== Step C: apply {MODE_LABELS[target]} ===")
+            apply_with_retry(target, target_sa)
+
+            log("=== Step D: verify final status ===")
+            final_state = read_current_state()
+            log(f"Read: net_select={final_state['net_select']!r}, "
+                f"sa_nsa_mode_disable_setting={final_state['sa_nsa_mode_disable_setting']!r}")
+            log(f"Final status: {describe_state(final_state)}")
+            if final_state["net_select"] != target:
+                raise RouterError(
+                    f"Final network type {final_state['net_select']!r} does not match "
+                    f"the requested {target!r}."
+                )
+            log(f"Done - switched to {MODE_LABELS[target]}.")
+            return 0
+
+        # --- Default: toggle through the other technology and back -----------
+        # This forces the modem to re-register (connection "refresh").
         other = MODE_4G if current == MODE_5G else MODE_5G
-        log(f"Current: {MODE_LABELS[current]} ({current}), "
-            f"5G standalone {SA_MODE_LABELS.get(sa_mode, sa_mode)}")
         log(f"Plan: {MODE_LABELS[current]} -> {MODE_LABELS[other]} (Apply) "
             f"-> {MODE_LABELS[current]} (Apply)")
 
@@ -362,14 +430,11 @@ def main() -> int:
         log(f"Restored to {MODE_LABELS[current]}.")
 
         # --- Verify ----------------------------------------------------------
-        log("=== Step E: verify final state ===")
+        log("=== Step E: verify final status ===")
         final_state = read_current_state()
         log(f"Read: net_select={final_state['net_select']!r}, "
             f"sa_nsa_mode_disable_setting={final_state['sa_nsa_mode_disable_setting']!r}")
-        log(f"Final Preferred Network Type: "
-            f"{MODE_LABELS.get(final_state['net_select'], final_state['net_select'])}, "
-            f"5G standalone "
-            f"{SA_MODE_LABELS.get(final_state['sa_nsa_mode_disable_setting'], '?')}")
+        log(f"Final status: {describe_state(final_state)}")
         if final_state["net_select"] != current:
             raise RouterError(
                 f"Final network type {final_state['net_select']!r} does not match "
